@@ -1,10 +1,24 @@
 import os
+import json
+import base64
 import requests
 import yfinance as yf
 import pandas as pd
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+GH_TOKEN = os.environ["GITHUB_TOKEN"]
+REPO = os.environ["GITHUB_REPOSITORY"]
+BRANCH = "main"
+
+API = f"https://api.github.com/repos/{REPO}/contents/last_signal.json"
+
+HEADERS = {
+    "Authorization": f"Bearer {GH_TOKEN}",
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28"
+}
+
 
 def get_data(interval):
     try:
@@ -24,15 +38,57 @@ def get_data(interval):
 
         df = df.dropna()
 
-        # Use completed candles only
+        # Exclude the currently forming candle.
         if len(df) > 1:
             df = df.iloc[:-1]
 
-        return df if len(df) >= 25 else None
+        return df if len(df) >= 30 else None
 
     except Exception as e:
-        print(f"Data error ({interval}): {e}")
+        print(f"Price data error: {e}")
         return None
+
+
+def read_last_signal():
+    response = requests.get(
+        API,
+        headers=HEADERS,
+        params={"ref": BRANCH},
+        timeout=20
+    )
+
+    if response.status_code == 404:
+        return None, None
+
+    response.raise_for_status()
+    item = response.json()
+
+    content = base64.b64decode(item["content"]).decode()
+    return json.loads(content), item["sha"]
+
+
+def save_last_signal(signal, sha):
+    content = base64.b64encode(
+        json.dumps(signal).encode()
+    ).decode()
+
+    payload = {
+        "message": "Save last processed gold signal",
+        "content": content,
+        "branch": BRANCH
+    }
+
+    if sha:
+        payload["sha"] = sha
+
+    response = requests.put(
+        API,
+        headers=HEADERS,
+        json=payload,
+        timeout=20
+    )
+
+    response.raise_for_status()
 
 
 def calculate_signal():
@@ -47,32 +103,47 @@ def calculate_signal():
     fast = close.rolling(9).mean()
     slow = close.rolling(21).mean()
 
-    previous_fast = fast.iloc[-2]
-    previous_slow = slow.iloc[-2]
-    current_fast = fast.iloc[-1]
-    current_slow = slow.iloc[-1]
+    # Search the four most recent completed M5 candles.
+    start = max(1, len(m5) - 4)
+    crossover = None
 
-    buy_cross = (
-        previous_fast <= previous_slow
-        and current_fast > current_slow
-    )
+    for i in range(start, len(m5)):
+        buy = (
+            fast.iloc[i - 1] <= slow.iloc[i - 1]
+            and fast.iloc[i] > slow.iloc[i]
+        )
 
-    sell_cross = (
-        previous_fast >= previous_slow
-        and current_fast < current_slow
-    )
+        sell = (
+            fast.iloc[i - 1] >= slow.iloc[i - 1]
+            and fast.iloc[i] < slow.iloc[i]
+        )
 
-    if not buy_cross and not sell_cross:
-        print("No fresh MA crossover on the latest completed M5 candle.")
+        if buy or sell:
+            crossover = (
+                i,
+                "BUY" if buy else "SELL"
+            )
+
+    if crossover is None:
+        print("No recent MA 9/21 crossover found.")
         return None
 
-    direction = "BUY" if buy_cross else "SELL"
+    i, direction = crossover
+    candle_time = m5.index[i].isoformat()
+
+    signal_id = f"{candle_time}_{direction}"
+
+    last_signal, sha = read_last_signal()
+
+    if last_signal and last_signal.get("id") == signal_id:
+        print("This crossover was already processed.")
+        return None
 
     high = m5["High"]
     low = m5["Low"]
     previous_close = close.shift(1)
 
-    tr = pd.concat(
+    true_range = pd.concat(
         [
             high - low,
             (high - previous_close).abs(),
@@ -81,32 +152,12 @@ def calculate_signal():
         axis=1
     ).max(axis=1)
 
-    atr = tr.rolling(14).mean().iloc[-1]
-    entry = float(close.iloc[-1])
+    atr = true_range.rolling(14).mean().iloc[i]
+    entry = float(close.iloc[i])
 
     if pd.isna(atr) or atr <= 0:
         print("Unable to calculate ATR.")
         return None
-
-    # Check the M15 trend for context, not as a signal blocker
-    score = 60
-    trend_text = "M15 trend unavailable"
-
-    if m15 is not None:
-        m15_close = m15["Close"]
-        m15_fast = m15_close.rolling(9).mean().iloc[-1]
-        m15_slow = m15_close.rolling(21).mean().iloc[-1]
-
-        if m15_fast > m15_slow:
-            trend_text = "M15 bullish"
-            if direction == "BUY":
-                score = 80
-        elif m15_fast < m15_slow:
-            trend_text = "M15 bearish"
-            if direction == "SELL":
-                score = 80
-        else:
-            trend_text = "M15 neutral"
 
     if direction == "BUY":
         sl = entry - 1.5 * atr
@@ -119,37 +170,64 @@ def calculate_signal():
         tp2 = entry - 2 * atr
         tp3 = entry - 3 * atr
 
-    return (
+    score = 60
+    trend = "Unavailable"
+
+    if m15 is not None:
+        c15 = m15["Close"]
+        ma9 = c15.rolling(9).mean().iloc[-1]
+        ma21 = c15.rolling(21).mean().iloc[-1]
+
+        if ma9 > ma21:
+            trend = "Bullish"
+            if direction == "BUY":
+                score = 80
+        elif ma9 < ma21:
+            trend = "Bearish"
+            if direction == "SELL":
+                score = 80
+        else:
+            trend = "Neutral"
+
+    message = (
         f"🟡 XAUUSD {direction}\n\n"
         f"📍 Entry: {entry:.2f}\n"
         f"🛑 Stop Loss: {sl:.2f}\n"
         f"🎯 TP1: {tp1:.2f}\n"
         f"🎯 TP2: {tp2:.2f}\n"
         f"🎯 TP3: {tp3:.2f}\n\n"
-        f"⏱️ Timeframe: M5\n"
+        f"⏱️ Timeframe: M5 + M15\n"
         f"📈 Strategy: MA 9/21 Crossover\n"
-        f"📊 {trend_text}\n"
+        f"📊 M15 Trend: {trend}\n"
         f"💪 Setup score: {score}/100\n\n"
         f"⚠️ Score is not a win probability. "
-        f"GC=F futures prices can differ from your broker's XAUUSD. "
+        f"GC=F futures prices may differ from broker XAUUSD. "
         f"Verify prices before trading."
     )
 
+    return {
+        "id": signal_id,
+        "message": message
+    }, sha
+
 
 def main():
-    signal = calculate_signal()
+    result = calculate_signal()
 
-    if not signal:
-        print("No signal sent on this run.")
+    if result is None:
+        print("No new signal to send.")
         return
 
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    signal, sha = result
+
+    # Save the crossover first to prevent duplicate alerts.
+    save_last_signal({"id": signal["id"]}, sha)
 
     response = requests.post(
-        url,
+        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
         json={
             "chat_id": CHAT_ID,
-            "text": signal
+            "text": signal["message"]
         },
         timeout=20
     )
