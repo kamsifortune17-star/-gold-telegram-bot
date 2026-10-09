@@ -8,7 +8,7 @@ CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 def get_data(interval):
     df = yf.download(
-        "XAUUSD=X",
+            "GC=F",
         period="5d",
         interval=interval,
         progress=False
